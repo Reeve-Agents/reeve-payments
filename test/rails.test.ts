@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import Stripe from "stripe";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { RailConfigError, railEntries, StripeRail, WebhookVerificationError, XenditRail } from "../src/index";
+import { RailConfigError, railEntries, StripeRail, SubAccountRequiredError, WebhookVerificationError, XenditRail } from "../src/index";
 
 /** A fake api.stripe.com: records every request (path, form body, idempotency key) and answers like Stripe. */
 const calls: { method: string; path: string; body: URLSearchParams; idem?: string }[] = [];
@@ -111,16 +111,27 @@ describe("Xendit rail (test mode)", () => {
     return reply(404, { error_code: "DATA_NOT_FOUND", message: url });
   }) as unknown as typeof fetch;
   const xendit = new XenditRail({ secretKey: "xnd_development_fake", webhookToken: "tok_123", fetch: fakeFetch });
+  const acct = { account: "661f87c614802d6c402cd82d" };
+
+  it("refuses every call, without sending a request, when the merchant has no sub-account", async () => {
+    const before = seen.length;
+    await expect(xendit.createInvoice(req)).rejects.toBeInstanceOf(SubAccountRequiredError);
+    await expect(xendit.createInvoice(req, {})).rejects.toThrow(/Hubungkan akun Xendit/);
+    await expect(xendit.getInvoice("ps-1")).rejects.toBeInstanceOf(SubAccountRequiredError);
+    await expect(xendit.refund({ invoiceId: "ps-1", status: "paid", amount: 1, amountPaid: 1, paymentRef: "pr-1" }, 1, "k")).rejects.toBeInstanceOf(SubAccountRequiredError);
+    expect(seen.length).toBe(before);
+  });
 
   it("refuses production keys", () => {
     expect(() => new XenditRail({ secretKey: "xnd_production_x" })).toThrow(RailConfigError);
   });
 
   it("creates a PAY session with a hosted link, whole rupiah, Basic auth", async () => {
-    const inv = await xendit.createInvoice(req);
+    const inv = await xendit.createInvoice(req, acct);
     expect(inv).toMatchObject({ invoiceId: "ps-1", status: "open", amount: 1_500_000, payUrl: "https://xen.to/abc" });
     const call = seen[0]!;
     expect(call.url).toBe("https://api.xendit.co/sessions");
+    expect(call.headers["for-user-id"]).toBe(acct.account); // settles in the merchant's sub-account
     expect(call.headers.authorization).toBe(`Basic ${Buffer.from("xnd_development_fake:").toString("base64")}`);
     expect(call.body).toMatchObject({ session_type: "PAY", mode: "PAYMENT_LINK", currency: "IDR", country: "ID", amount: 1_500_000, reference_id: "op_1:K01-2026-11" });
     expect((call.body!.customer as { reference_id: string }).reference_id).toBe("op1K01202611");
@@ -128,14 +139,16 @@ describe("Xendit rail (test mode)", () => {
   });
 
   it("can only settle a payment the tenant started on the hosted page", async () => {
-    await expect(xendit.simulatePayment("ps-1")).rejects.toThrow(/open the payment link/);
+    await expect(xendit.simulatePayment("ps-1", acct)).rejects.toThrow(/open the payment link/);
     Object.assign(sessions["ps-1"] as object, { latest_payment_request_id: "pr-1" });
-    const paid = await xendit.simulatePayment("ps-1");
+    const paid = await xendit.simulatePayment("ps-1", acct);
     expect(paid).toMatchObject({ status: "paid", amountPaid: 1_500_000, paymentRef: "pr-1" });
     const sim = seen.find((s) => s.url.includes("/simulate"))!;
     expect(sim.headers["api-version"]).toBe("2024-11-11");
-    const r = await xendit.refund(paid, 250_000, "op_1:ex-1:refund");
+    const r = await xendit.refund(paid, 250_000, "op_1:ex-1:refund", acct);
     expect(r).toEqual({ refundId: "rfd-1", status: "pending" });
+    expect(seen.at(-1)!.headers["for-user-id"]).toBe(acct.account);
+    expect(seen.filter((s) => s.url.startsWith("https://")).every((s) => s.headers["for-user-id"] === acct.account)).toBe(true);
     expect(seen.at(-1)!.body).toMatchObject({ payment_request_id: "pr-1", amount: 250_000, reason: "DUPLICATE", currency: "IDR" });
   });
 
@@ -144,6 +157,12 @@ describe("Xendit rail (test mode)", () => {
     expect(xendit.parseWebhook(body, { "x-callback-token": "tok_123" })).toEqual({ type: "invoice.paid", eventId: "py-1", invoiceId: "ps-1", amount: 1_500_000, at: "2026-10-18T03:00:00Z", paymentRef: "pr-1" });
     expect(() => xendit.parseWebhook(body, { "x-callback-token": "nope" })).toThrow(WebhookVerificationError);
     expect(() => xendit.parseWebhook(body, {})).toThrow(WebhookVerificationError);
+  });
+
+  it("reads the sub-account from the webhook's business_id", () => {
+    const body = (event: string) => JSON.stringify({ event, business_id: acct.account, created: "2026-10-18T03:00:00Z", data: { payment_session_id: "ps-1", amount: 5, payment_id: "py-1", status: "COMPLETED" } });
+    expect(xendit.parseWebhook(body("payment_session.completed"), { "x-callback-token": "tok_123" })).toMatchObject({ type: "invoice.paid", account: acct.account });
+    expect(xendit.parseWebhook(body("payment_session.expired"), { "x-callback-token": "tok_123" })).toMatchObject({ type: "invoice.expired", account: acct.account });
   });
 });
 

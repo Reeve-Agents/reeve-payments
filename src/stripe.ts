@@ -17,6 +17,10 @@ const fromMinor = (minor: number) => Math.round(minor / 100);
 /**
  * Stripe Invoicing in test mode: one customer, one invoice item and one finalised
  * `send_invoice` invoice per bill, paid on Stripe's hosted invoice page.
+ *
+ * TODO(per-merchant): Stripe is test-mode only and not offered to Indonesian merchants. To go per-merchant, pass
+ * `{ stripeAccount: ctx.account }` as request options on every call (Stripe Connect, `Stripe-Account` header) and
+ * read the top-level `account` of Connect webhook events into RailEvent.account.
  */
 export class StripeRail implements PaymentRail {
   readonly name = "stripe";
